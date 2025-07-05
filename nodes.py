@@ -12,7 +12,7 @@ from PIL import Image, ImageOps, ImageSequence
 import torch
 
 import folder_paths
-from nodes import MAX_RESOLUTION
+from nodes import MAX_RESOLUTION, LoadImage
 
 from .saver.saver import save_image
 from .utils import get_sha256, full_checkpoint_path_for
@@ -85,7 +85,7 @@ class Metadata:
     a111_params: str
     final_hashes: str
 
-class LoadImageWithMetadata:
+class LoadImageWithMetadata(LoadImage):
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
         input_dir = folder_paths.get_input_directory()
@@ -98,59 +98,24 @@ class LoadImageWithMetadata:
 
     CATEGORY = "ImageSaver"
     DESCRIPTION = "Load image and extract metadata for Image Saver"
-    RETURN_TYPES = ("IMAGE", "METADATA")
-    RETURN_NAMES = ("image", "metadata")
+    RETURN_TYPES = ("IMAGE", "MASK", "METADATA")
+    RETURN_NAMES = ("image", "mask", "metadata")
     FUNCTION = "load_image"
 
     def load_image(self, image):
         image_path = folder_paths.get_annotated_filepath(image)
         
         img = Image.open(image_path)
-        output_images = []
-        output_masks = []
-        w, h = None, None
-
-        excluded_formats = ['MPO']
-        
-        for i in ImageSequence.Iterator(img):
-            i = ImageOps.exif_transpose(i)
-            if i.mode == 'I':
-                i = i.point(lambda i: i * (1 / 255))
-            image = i.convert("RGB")
-            
-            if len(output_images) == 0:
-                w, h = image.size
-                
-            if image.size != (w, h):
-                continue
-                
-            image = np.array(image).astype(np.float32) / 255.0
-            image = torch.from_numpy(image)[None,]
-            if 'A' in i.getbands():
-                mask = np.array(i.getchannel('A')).astype(np.float32) / 255.0
-                mask = 1. - torch.from_numpy(mask)
-            else:
-                mask = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
-            output_images.append(image)
-            output_masks.append(mask.unsqueeze(0))
-
-        if len(output_images) > 1 and img.format not in excluded_formats:
-            output_image = torch.cat(output_images, dim=0)
-            output_mask = torch.cat(output_masks, dim=0)
-        else:
-            output_image = output_images[0]
-            output_mask = output_masks[0]
+        output_image, output_mask = super().load_image(image)
 
         # Extract metadata from image
         metadata = LoadImageWithMetadata.extract_metadata_from_image(img, image_path)
         
-        return (output_image, metadata)
+        return (output_image, output_mask, metadata)
 
     @staticmethod
-    def extract_metadata_from_image(img: Image.Image, image_path: str) -> Metadata:
-        """Extract metadata from image and return Metadata object."""
-        print(f"DEBUG: LoadImageWithMetadata - Extracting metadata from: {image_path}")
-        
+    def extract_metadata_from_image(img: Image.Image) -> Metadata:
+        """Extract metadata from image and return Metadata object."""        
         # Default values
         positive = ""
         negative = ""
