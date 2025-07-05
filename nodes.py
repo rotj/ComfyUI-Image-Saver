@@ -6,8 +6,9 @@ from typing import Any
 import json
 import numpy as np
 import re
+import hashlib
 
-from PIL import Image
+from PIL import Image, ImageOps, ImageSequence
 import torch
 
 import folder_paths
@@ -83,6 +84,206 @@ class Metadata:
     ckpt_path: str
     a111_params: str
     final_hashes: str
+
+class LoadImageWithMetadata:
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, Any]:
+        input_dir = folder_paths.get_input_directory()
+        files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+        return {
+            "required": {
+                "image": (sorted(files), {"image_upload": True}),
+            },
+        }
+
+    CATEGORY = "ImageSaver"
+    DESCRIPTION = "Load image and extract metadata for Image Saver"
+    RETURN_TYPES = ("IMAGE", "METADATA")
+    RETURN_NAMES = ("image", "metadata")
+    FUNCTION = "load_image"
+
+    def load_image(self, image):
+        image_path = folder_paths.get_annotated_filepath(image)
+        
+        img = Image.open(image_path)
+        output_images = []
+        output_masks = []
+        w, h = None, None
+
+        excluded_formats = ['MPO']
+        
+        for i in ImageSequence.Iterator(img):
+            i = ImageOps.exif_transpose(i)
+            if i.mode == 'I':
+                i = i.point(lambda i: i * (1 / 255))
+            image = i.convert("RGB")
+            
+            if len(output_images) == 0:
+                w, h = image.size
+                
+            if image.size != (w, h):
+                continue
+                
+            image = np.array(image).astype(np.float32) / 255.0
+            image = torch.from_numpy(image)[None,]
+            if 'A' in i.getbands():
+                mask = np.array(i.getchannel('A')).astype(np.float32) / 255.0
+                mask = 1. - torch.from_numpy(mask)
+            else:
+                mask = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
+            output_images.append(image)
+            output_masks.append(mask.unsqueeze(0))
+
+        if len(output_images) > 1 and img.format not in excluded_formats:
+            output_image = torch.cat(output_images, dim=0)
+            output_mask = torch.cat(output_masks, dim=0)
+        else:
+            output_image = output_images[0]
+            output_mask = output_masks[0]
+
+        # Extract metadata from image
+        metadata = LoadImageWithMetadata.extract_metadata_from_image(img, image_path)
+        
+        return (output_image, metadata)
+
+    @staticmethod
+    def extract_metadata_from_image(img: Image.Image, image_path: str) -> Metadata:
+        """Extract metadata from image and return Metadata object."""
+        print(f"DEBUG: LoadImageWithMetadata - Extracting metadata from: {image_path}")
+        
+        # Default values
+        positive = ""
+        negative = ""
+        width = img.width
+        height = img.height
+        seed = 0
+        steps = 0
+        cfg = 0
+        sampler_name = ""
+        scheduler_name = ""
+        denoise = 1.0
+        clip_skip = 0
+        modelname = ""
+        a111_params = ""
+        
+        try:
+            # Try to get metadata from various sources
+            metadata_found = False
+            
+            # Check PNG info (most common for AI-generated images)
+            if hasattr(img, 'text') and img.text:
+                print(f"DEBUG: LoadImageWithMetadata - Found PNG text metadata")
+                for key, value in img.text.items():
+                    print(f"DEBUG: LoadImageWithMetadata - PNG text key: {key}")
+                    if key.lower() in ['parameters', 'params', 'generation_params']:
+                        print(f"DEBUG: LoadImageWithMetadata - Found parameters in PNG text")
+                        a111_params = value
+                        metadata_found = True
+                        break
+            
+            # Check EXIF data
+            if not metadata_found and hasattr(img, '_getexif') and img._getexif():
+                print(f"DEBUG: LoadImageWithMetadata - Checking EXIF data")
+                exif = img._getexif()
+                # Common EXIF tags that might contain AI generation parameters
+                for tag_id, value in exif.items():
+                    if isinstance(value, str) and ('Steps:' in value or 'Sampler:' in value):
+                        print(f"DEBUG: LoadImageWithMetadata - Found parameters in EXIF tag {tag_id}")
+                        a111_params = value
+                        metadata_found = True
+                        break
+            
+            # Check image info (PIL)
+            if not metadata_found and hasattr(img, 'info') and img.info:
+                print(f"DEBUG: LoadImageWithMetadata - Checking PIL info")
+                for key, value in img.info.items():
+                    print(f"DEBUG: LoadImageWithMetadata - PIL info key: {key}")
+                    if isinstance(value, str) and ('Steps:' in value or 'Sampler:' in value):
+                        print(f"DEBUG: LoadImageWithMetadata - Found parameters in PIL info")
+                        a111_params = value
+                        metadata_found = True
+                        break
+                    elif key.lower() in ['parameters', 'params', 'generation_params']:
+                        print(f"DEBUG: LoadImageWithMetadata - Found parameters key in PIL info")
+                        a111_params = str(value)
+                        metadata_found = True
+                        break
+            
+            # If we found A1111-style parameters, parse them
+            if metadata_found and a111_params:
+                print(f"DEBUG: LoadImageWithMetadata - Parsing A1111 parameters, length: {len(a111_params)}")
+                parsed_metadata = ImageSaverSimple.parse_a1111_params(a111_params)
+                
+                # Use parsed values
+                positive = parsed_metadata.positive
+                negative = parsed_metadata.negative
+                width = parsed_metadata.width
+                height = parsed_metadata.height
+                seed = parsed_metadata.seed
+                steps = parsed_metadata.steps
+                cfg = parsed_metadata.cfg
+                sampler_name = parsed_metadata.sampler_name
+                scheduler_name = parsed_metadata.scheduler_name
+                denoise = parsed_metadata.denoise
+                clip_skip = parsed_metadata.clip_skip
+                modelname = parsed_metadata.modelname
+                
+                print(f"DEBUG: LoadImageWithMetadata - Successfully parsed metadata")
+            else:
+                print(f"DEBUG: LoadImageWithMetadata - No A1111-style parameters found, using defaults")
+                # Use image dimensions if no metadata found
+                width = img.width
+                height = img.height
+                a111_params = f"unknown\nNegative prompt: unknown\nSteps: {steps}, Sampler: {sampler_name or 'unknown'}, CFG scale: {cfg}, Seed: {seed}, Size: {width}x{height}, Model: {modelname or 'unknown'}, Version: ComfyUI"
+                
+        except Exception as e:
+            print(f"DEBUG: LoadImageWithMetadata - Error extracting metadata: {e}")
+            # Use defaults and image dimensions
+            width = img.width
+            height = img.height
+            a111_params = f"unknown\nNegative prompt: unknown\nSteps: {steps}, Sampler: {sampler_name or 'unknown'}, CFG scale: {cfg}, Seed: {seed}, Size: {width}x{height}, Model: {modelname or 'unknown'}, Version: ComfyUI"
+        
+        # Create and return metadata object
+        metadata = Metadata(
+            modelname=modelname,
+            positive=positive,
+            negative=negative,
+            width=width,
+            height=height,
+            seed=seed,
+            steps=steps,
+            cfg=cfg,
+            sampler_name=sampler_name,
+            scheduler_name=scheduler_name,
+            denoise=denoise,
+            clip_skip=clip_skip,
+            additional_hashes="",
+            ckpt_path="",
+            a111_params=a111_params,
+            final_hashes=""
+        )
+        
+        print(f"DEBUG: LoadImageWithMetadata - Created metadata object with:")
+        print(f"  positive: {repr(positive[:100])}...")
+        print(f"  negative: {repr(negative[:100])}...")
+        print(f"  size: {width}x{height}")
+        print(f"  model: {repr(modelname)}")
+        
+        return metadata
+
+    @classmethod
+    def IS_CHANGED(cls, image):
+        image_path = folder_paths.get_annotated_filepath(image)
+        m = hashlib.sha256()
+        with open(image_path, 'rb') as f:
+            m.update(f.read())
+        return m.digest().hex()
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, image):
+        if not folder_paths.exists_annotated_filepath(image):
+            return "Invalid image file: {}".format(image)
+        return True
 
 class ImageSaverMetadata:
     @classmethod
@@ -200,6 +401,7 @@ class ImageSaverSimple:
             },
             "optional": {
                 "metadata":              ("METADATA", {"default": None,                                             "tooltip": "metadata to embed in the image"}),
+                "a1111_params":          ("STRING",   {"default": "", "multiline": True,                           "tooltip": "A1111-style parameters string to parse metadata from (only used if metadata input is not connected)"}),
                 "counter":               ("INT",      {"default": 0, "min": 0, "max": 0xffffffffffffffff,           "tooltip": "counter"}),
                 "time_format":           ("STRING",   {"default": "%Y-%m-%d-%H%M%S", "multiline": False,            "tooltip": "timestamp format"}),
                 "show_preview":          ("BOOLEAN",  {"default": True,                                             "tooltip": "if True, displays saved images in the UI preview"}),
@@ -232,13 +434,17 @@ class ImageSaverSimple:
         save_workflow_as_json: bool = False,
         show_preview: bool = True,
         metadata: Metadata | None = None,
+        a1111_params: str = "",
         counter: int = 0,
         time_format: str = "%Y-%m-%d-%H%M%S",
         prompt: dict[str, Any] | None = None,
         extra_pnginfo: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if metadata is None:
-            metadata = Metadata('', '', '', 512, 512, 0, 20, 7.0, '', 'normal', 1.0, 0, '', '', '', '')
+            if a1111_params.strip():
+                metadata = ImageSaverSimple.parse_a1111_params(a1111_params)
+            else:
+                metadata = Metadata('', '', '', 512, 512, 0, 20, 7.0, '', 'normal', 1.0, 0, '', '', '', '')
 
         path = make_pathname(path, metadata.width, metadata.height, metadata.seed, metadata.modelname, counter, time_format, metadata.sampler_name, metadata.steps, metadata.cfg, metadata.scheduler_name, metadata.denoise, metadata.clip_skip)
 
@@ -254,6 +460,115 @@ class ImageSaverSimple:
             result["ui"] = {"images": [{"filename": filename, "subfolder": subfolder if subfolder != '.' else '', "type": 'output'} for filename in filenames]}
 
         return result
+
+    @staticmethod
+    def parse_a1111_params(a1111_params: str) -> Metadata:
+        """Parse A1111-style parameters string into Metadata object."""
+        # Default values
+        positive = "unknown"
+        negative = "unknown"
+        width = 512
+        height = 512
+        seed = 0
+        steps = 20
+        cfg = 7.0
+        sampler_name = ""
+        scheduler_name = "normal"
+        denoise = 1.0
+        clip_skip = 0
+        modelname = ""
+        
+        try:
+            # Split by lines and process
+            lines = a1111_params.strip().split('\n')
+            
+            # First line is usually the positive prompt
+            if lines:
+                positive = lines[0].strip()
+            
+            # Look for negative prompt
+            for i, line in enumerate(lines):
+                if line.strip().startswith("Negative prompt:"):
+                    negative = line.replace("Negative prompt:", "").strip()
+                    break
+            
+            # Find the parameters line (usually starts with "Steps:")
+            params_line = ""
+            for line in lines:
+                if line.strip().startswith("Steps:"):
+                    params_line = line.strip()
+                    break
+            
+            if params_line:
+                # Parse parameters using regex patterns
+                import re
+                
+                # Steps
+                steps_match = re.search(r'Steps:\s*(\d+)', params_line)
+                if steps_match:
+                    steps = int(steps_match.group(1))
+                
+                # Sampler
+                sampler_match = re.search(r'Sampler:\s*([^,]+)', params_line)
+                if sampler_match:
+                    sampler_name = sampler_match.group(1).strip()
+                
+                # CFG scale
+                cfg_match = re.search(r'CFG scale:\s*([\d.]+)', params_line)
+                if cfg_match:
+                    cfg = float(cfg_match.group(1))
+                
+                # Seed
+                seed_match = re.search(r'Seed:\s*(\d+)', params_line)
+                if seed_match:
+                    seed = int(seed_match.group(1))
+                
+                # Size
+                size_match = re.search(r'Size:\s*(\d+)x(\d+)', params_line)
+                if size_match:
+                    width = int(size_match.group(1))
+                    height = int(size_match.group(2))
+                
+                # Clip skip
+                clip_skip_match = re.search(r'Clip skip:\s*(\d+)', params_line)
+                if clip_skip_match:
+                    clip_skip = int(clip_skip_match.group(1))
+                
+                # Model
+                model_match = re.search(r'Model:\s*([^,]+)', params_line)
+                if model_match:
+                    modelname = model_match.group(1).strip()
+                
+                # Denoise (if present)
+                denoise_match = re.search(r'Denoising strength:\s*([\d.]+)', params_line)
+                if denoise_match:
+                    denoise = float(denoise_match.group(1))
+                
+        except Exception as e:
+            print(f"Error parsing A1111 params: {e}")
+        
+        # Create metadata object with parsed values
+        # The a111_params field should contain the original input string
+        metadata = Metadata(
+            modelname=modelname,
+            positive=positive,
+            negative=negative,
+            width=width,
+            height=height,
+            seed=seed,
+            steps=steps,
+            cfg=cfg,
+            sampler_name=sampler_name,
+            scheduler_name=scheduler_name,
+            denoise=denoise,
+            clip_skip=clip_skip,
+            additional_hashes="",
+            ckpt_path="",
+            a111_params=a1111_params,
+            final_hashes=""
+        )
+        
+        return metadata
 
 class ImageSaver:
     @classmethod

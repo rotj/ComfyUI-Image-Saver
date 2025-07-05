@@ -1,6 +1,6 @@
 from typing import Any
 
-from .nodes import ImageSaver, ImageSaverSimple, ImageSaverMetadata
+from .nodes import ImageSaver, ImageSaverSimple, ImageSaverMetadata, LoadImageWithMetadata
 from .nodes_literals import SeedGenerator, StringLiteral, SizeLiteral, IntLiteral, FloatLiteral, CfgLiteral
 from .nodes_loaders import CheckpointLoaderWithName, UNETLoaderWithName
 from .nodes_selectors import SamplerSelector, SchedulerSelector, SchedulerSelectorComfy, SchedulerToString, SamplerToString, SchedulerComfyToString, InputParameters
@@ -9,6 +9,7 @@ from .civitai_nodes import CivitaiHashFetcher
 NODE_CLASS_MAPPINGS: dict[str, Any] = {
     "Checkpoint Loader with Name (Image Saver)": CheckpointLoaderWithName,
     "UNet loader with Name (Image Saver)": UNETLoaderWithName,
+    "Load Image with Metadata (Image Saver)": LoadImageWithMetadata,
     "Image Saver": ImageSaver,
     "Image Saver Simple": ImageSaverSimple,
     "Image Saver Metadata": ImageSaverMetadata,
