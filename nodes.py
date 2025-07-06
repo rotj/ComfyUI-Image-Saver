@@ -109,7 +109,7 @@ class LoadImageWithMetadata(LoadImage):
         output_image, output_mask = super().load_image(image)
 
         # Extract metadata from image
-        metadata = LoadImageWithMetadata.extract_metadata_from_image(img, image_path)
+        metadata = LoadImageWithMetadata.extract_metadata_from_image(img)
         
         return (output_image, output_mask, metadata)
 
